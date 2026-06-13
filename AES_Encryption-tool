@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""
+aes_tool.py
+===========
+A command-line AES-256 file encryption and decryption tool.
+
+Features:
+  - AES-256-CBC encryption using a password
+  - PBKDF2-HMAC-SHA256 key derivation (310,000 iterations)
+  - Random salt and IV generated per encryption
+  - HMAC-SHA256 authentication to detect tampering
+  - Encrypts any file type (documents, images, archives, etc.)
+  - Secure password input (hidden while typing)
+  - Encrypted files are portable — decrypt on any machine with this tool
+
+Usage:
+  python aes_tool.py --encrypt secret.pdf
+  python aes_tool.py --decrypt secret.pdf.enc
+  python aes_tool.py --encrypt folder/report.docx --output safe.enc
+  python aes_tool.py --encrypt image.png --shred
+
+Requirements:
+  pip install cryptography
+
+Author: github.com/ashtonhickswv-sudo
+License: MIT
+"""
+
+import argparse
+import hashlib
+import hmac
+import os
+import sys
+from getpass import getpass
+from pathlib import Path
+
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives import padding, hashes, hmac as crypto_hmac
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.backends import default_backend
+except ImportError:
+    print("\n  [!] Missing dependency. Run:  pip install cryptography\n")
+    sys.exit(1)
+
+# ─── ANSI colours ─────────────────────────────────────────────────────────────
+RED    = "\033[91m"
+YELLOW = "\033[93m"
+GREEN  = "\033[92m"
+CYAN   = "\033[96m"
+BOLD   = "\033[1m"
+RESET  = "\033[0m"
+
+def c(text: str, colour: str) -> str:
+    return f"{colour}{text}{RESET}"
+
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+MAGIC        = b"AESTOOL1"   # File header identifier
+SALT_SIZE    = 32            # bytes
+IV_SIZE      = 16            # bytes (AES block size)
+HMAC_SIZE    = 32            # bytes (SHA-256 output)
+KDF_ITERS    = 310_000       # PBKDF2 iterations (NIST recommended 2024)
+KEY_SIZE     = 32            # bytes = AES-256
+ENC_EXT      = ".enc"
+
+
+# ─── Key derivation ───────────────────────────────────────────────────────────
+def derive_keys(password: str, salt: bytes) -> tuple[bytes, bytes]:
+    """
+    Derive two independent 256-bit keys from a password + salt using PBKDF2.
+    Key 1 → AES encryption key
+    Key 2 → HMAC authentication key
+    """
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=KEY_SIZE * 2,        # 64 bytes total → split into two keys
+        salt=salt,
+        iterations=KDF_ITERS,
+        backend=default_backend(),
+    )
+    key_material = kdf.derive(password.encode("utf-8"))
+    return key_material[:KEY_SIZE], key_material[KEY_SIZE:]
+
+
+# ─── Encryption ───────────────────────────────────────────────────────────────
+def encrypt_file(input_path: Path, output_path: Path, password: str) -> None:
+    """
+    Encrypt a file using AES-256-CBC with HMAC-SHA256 authentication.
+
+    Encrypted file format:
+    [ MAGIC (8) | SALT (32) | IV (16) | HMAC (32) | CIPHERTEXT (N) ]
+    """
+    plaintext = input_path.read_bytes()
+
+    # Generate random salt and IV
+    salt = os.urandom(SALT_SIZE)
+    iv   = os.urandom(IV_SIZE)
+
+    # Derive keys
+    print(c("  [~] Deriving keys …", CYAN))
+    enc_key, mac_key = derive_keys(password, salt)
+
+    # Pad plaintext to AES block boundary
+    padder    = padding.PKCS7(128).padder()
+    padded    = padder.update(plaintext) + padder.finalize()
+
+    # Encrypt
+    print(c("  [~] Encrypting …", CYAN))
+    cipher     = Cipher(algorithms.AES(enc_key), modes.CBC(iv), backend=default_backend())
+    encryptor  = cipher.encryptor()
+    ciphertext = encryptor.update(padded) + encryptor.finalize()
+
+    # Compute HMAC over salt + iv + ciphertext (encrypt-then-MAC)
+    h = crypto_hmac.HMAC(mac_key, hashes.SHA256(), backend=default_backend())
+    h.update(salt + iv + ciphertext)
+    mac = h.finalize()
+
+    # Write output file
+    with open(output_path, "wb") as f:
+        f.write(MAGIC)
+        f.write(salt)
+        f.write(iv)
+        f.write(mac)
+        f.write(ciphertext)
+
+    original_size  = len(plaintext)
+    encrypted_size = output_path.stat().st_size
+    print(c(f"\n  ✔ Encrypted successfully!", GREEN))
+    print(f"  Input  : {input_path}  ({original_size:,} bytes)")
+    print(f"  Output : {output_path}  ({encrypted_size:,} bytes)")
+    print(f"  Cipher : AES-256-CBC  |  KDF: PBKDF2-SHA256 ({KDF_ITERS:,} iters)")
+
+
+# ─── Decryption ───────────────────────────────────────────────────────────────
+def decrypt_file(input_path: Path, output_path: Path, password: str) -> None:
+    """
+    Decrypt and authenticate an AES-256-CBC encrypted file.
+    Raises an error if the HMAC check fails (wrong password or tampered file).
+    """
+    data = input_path.read_bytes()
+
+    # Validate magic header
+    if data[:len(MAGIC)] != MAGIC:
+        print(c("\n  [!] Not a valid encrypted file or file is corrupted.", RED))
+        sys.exit(1)
+
+    # Parse header fields
+    offset     = len(MAGIC)
+    salt       = data[offset : offset + SALT_SIZE];       offset += SALT_SIZE
+    iv         = data[offset : offset + IV_SIZE];         offset += IV_SIZE
+    stored_mac = data[offset : offset + HMAC_SIZE];       offset += HMAC_SIZE
+    ciphertext = data[offset:]
+
+    # Derive keys
+    print(c("  [~] Deriving keys …", CYAN))
+    enc_key, mac_key = derive_keys(password, salt)
+
+    # Verify HMAC before decrypting (prevents padding oracle attacks)
+    print(c("  [~] Verifying integrity …", CYAN))
+    h = crypto_hmac.HMAC(mac_key, hashes.SHA256(), backend=default_backend())
+    h.update(salt + iv + ciphertext)
+    try:
+        h.verify(stored_mac)
+    except Exception:
+        print(c("\n  [!] Authentication failed — wrong password or file has been tampered with.", RED))
+        sys.exit(1)
+
+    # Decrypt
+    print(c("  [~] Decrypting …", CYAN))
+    cipher    = Cipher(algorithms.AES(enc_key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    padded    = decryptor.update(ciphertext) + decryptor.finalize()
+
+    # Remove padding
+    unpadder  = padding.PKCS7(128).unpadder()
+    plaintext = unpadder.update(padded) + unpadder.finalize()
+
+    output_path.write_bytes(plaintext)
+
+    print(c(f"\n  ✔ Decrypted successfully!", GREEN))
+    print(f"  Input  : {input_path}")
+    print(f"  Output : {output_path}  ({len(plaintext):,} bytes)")
+
+
+# ─── Secure shred ─────────────────────────────────────────────────────────────
+def shred_file(path: Path) -> None:
+    """
+    Overwrite a file with random bytes before deleting it.
+    Reduces (but does not guarantee) recoverability on HDDs.
+    Note: Not effective on SSDs with wear-levelling.
+    """
+    size = path.stat().st_size
+    with open(path, "r+b") as f:
+        for _ in range(3):
+            f.seek(0)
+            f.write(os.urandom(size))
+            f.flush()
+            os.fsync(f.fileno())
+    path.unlink()
+    print(c(f"  [~] Shredded original file: {path}", YELLOW))
+
+
+# ─── Password prompt ──────────────────────────────────────────────────────────
+def get_password(confirm: bool = False) -> str:
+    """Prompt for a password securely (input hidden). Optionally confirm it."""
+    password = getpass("  Enter password: ")
+    if not password:
+        print(c("  [!] Password cannot be empty.", RED))
+        sys.exit(1)
+    if confirm:
+        confirm_pw = getpass("  Confirm password: ")
+        if password != confirm_pw:
+            print(c("  [!] Passwords do not match.", RED))
+            sys.exit(1)
+    return password
+
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="AES-256 file encryption and decryption tool.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--encrypt", metavar="FILE", help="File to encrypt")
+    mode.add_argument("--decrypt", metavar="FILE", help="File to decrypt")
+
+    parser.add_argument("-o", "--output", metavar="FILE",
+                        help="Output file path (default: auto-generated)")
+    parser.add_argument("--shred", action="store_true",
+                        help="Securely overwrite and delete the original file after encrypting")
+
+    args = parser.parse_args()
+
+    print(c("\n  🔒  AES-256 File Encryption Tool  —  github.com/ashtonhickswv-sudo\n", CYAN))
+
+    if args.encrypt:
+        input_path = Path(args.encrypt)
+        if not input_path.exists():
+            print(c(f"  [!] File not found: {input_path}", RED))
+            sys.exit(1)
+
+        output_path = Path(args.output) if args.output else input_path.with_suffix(input_path.suffix + ENC_EXT)
+        password    = get_password(confirm=True)
+        print()
+
+        encrypt_file(input_path, output_path, password)
+
+        if args.shred:
+            shred_file(input_path)
+
+    elif args.decrypt:
+        input_path = Path(args.decrypt)
+        if not input_path.exists():
+            print(c(f"  [!] File not found: {input_path}", RED))
+            sys.exit(1)
+
+        # Auto-detect output name by stripping .enc extension
+        if args.output:
+            output_path = Path(args.output)
+        elif input_path.suffix == ENC_EXT:
+            output_path = input_path.with_suffix("")
+        else:
+            output_path = input_path.with_name(input_path.stem + "_decrypted" + input_path.suffix)
+
+        password = get_password(confirm=False)
+        print()
+
+        decrypt_file(input_path, output_path, password)
+
+    print()
+
+
+if __name__ == "__main__":
+    main()
